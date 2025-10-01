@@ -1,0 +1,2055 @@
+*************************************
+*************************************
+********COHORT CONSTRUCTION**********
+*************************************
+*************************************
+
+***********************************************
+**1 LOADING RUGBY/REF DATA
+**  DROPPING CASES WITH
+**  A. UNCERTAIN LINKS
+**  B. BORN PRIOR TO 1920
+**  C. LAST YEAR ACTIVE PRIOR TO 1950
+
+**SAS CODE**
+***********************************************;
+
+
+*set up libraries;
+libname sand2 ODBC dsn= idi_sandpit_srvprd schema="DL-MAA2016-21"; /*our project sandpit library*/
+libname steph "/nas/DataLab/MAA/MAA2016-21 The Health Impacts of Playing Rugby/Steph/Data";
+
+
+** load datasets;
+*original data - this has a rugby id but no spine id;
+proc sql;
+	create table rugby as select * from sand2.fml_rugby_1950_2000;
+quit;
+
+proc contents data=rugby; run;
+
+*check that there are no duplicates;
+proc freq data=rugby noprint;
+table snz_fml_3_uid / out =  rugby_dup;
+run;
+proc means data=rugby_dup; run;
+* no duplicates;
+
+**runkey 861 is specific to our main dataset. Relevant refresh is 20200120. Restrict to that in datalink table,
+This info was obtained from the link run table in SQL;
+
+*data link table - this has the rugby id and the corresponding spine id;
+proc sql;
+	create table datalink as select * from sand2.data_link
+	where run_key = 861;
+quit;
+
+proc freq data=datalink; table pass_nbr; run;
+*>90% had pass = 1. Rest had pass = 2;
+
+*looking at the distribution of weights for those with pass = 1;
+proc freq data=datalink; 
+table weight_nbr;
+where pass_nbr = 1;
+run;
+
+*looking at the distribution of weights for those with pass = 1 and non-exact matches;
+proc freq data=datalink; 
+table weight_nbr;
+where pass_nbr = 1 and near_exact_ind = 0;
+run;
+
+
+*check for duplicates in spine_uids (lhs_nbr) - are there two spine ids linked to the same rugby id?;
+proc freq data=datalink noprint;
+table rhs_nbr / out =  rugby_id;
+run;
+proc means data=rugby_id; run;
+
+*link in info from datalink table to rugby table;
+proc sql;
+	create table rugby_links as 
+	select * from rugby a left join datalink b 
+	on a.snz_fml_3_uid=b.rhs_nbr;
+quit;
+
+proc means data=rugby_links; run;
+* > 95% able to be linked - but some may be duplicate links;
+
+*check for duplicates in spine_uids (lhs_nbr);
+proc freq data=rugby_links noprint;
+table lhs_nbr / out =  spine_id;
+run;
+proc means data=spine_id; where lhs_nbr ne .; run;
+*duplicates present; 
+
+proc sort data=spine_id; by descending count; run;
+
+*Near exact indicators;
+proc freq data=rugby_links; table near_exact_ind; run;
+
+*restrict to near exact matches; 
+data rugby_exact; set rugby_links;
+where near_exact_ind = 1;
+run;
+
+*check for duplicates in here (lhs_nbr);
+proc freq data=rugby_exact noprint;
+table lhs_nbr / out =  exact_id;
+run;
+
+proc means data=exact_id; run;
+proc sort data=exact_id; by descending count; run;
+*there are duplicates;
+
+*look at those with duplicate spine ids;
+data spine_dup; set spine_id; 
+where lhs_nbr ne . and count > 1; 
+drop count percent;
+run;
+
+*look at these within the dataset;
+proc sql; 
+	create table rugby_dup as select * from spine_dup a 
+	left join rugby_links b
+	on a.lhs_nbr = b.lhs_nbr;
+quit;
+
+*how many are non-exact links;
+proc freq data=rugby_links; table near_exact_ind; run;
+
+*look at weights for non-exact vs near-exact links;
+proc sort data=rugby_links; by near_exact_ind; run;
+proc means data=rugby_links; var weight_nbr; by near_exact_ind; run;
+
+proc sql;
+	create table wgt_dup as 
+	select * from rugby_dup 
+	group by lhs_nbr, weight_nbr
+	having count(*) >= 2;
+quit;
+*remove these; 
+*some pairs linked to same person and have same weight - cannot distinguish between who to drop and who to keep;
+
+data rugby_dup2; set rugby_dup; 
+if weight_nbr < 10 then lwgt = 1; else lwgt = 0;
+run;
+
+proc sort data=rugby_dup2; by lhs_nbr descending lwgt weight_nbr; run;
+
+*****************************************************;
+*how many are non duplicates - one to one links (i.e. one unique rugby id linked to a unique spine id);
+proc means data=spine_id; where count = 1; run;
+
+ 
+*restrict to the one to one links;
+data spine_id_2; set spine_id;
+where count = 1;
+run;
+
+proc sql;
+	create table nodup_id as 
+	select a.lhs_nbr, a.count as unique_link, b.near_exact_ind
+	from spine_id_2 a left join rugby_links b
+	on a.lhs_nbr = b.lhs_nbr;
+quit;
+
+*how many of these one to ones are near exact indicators;
+*Near exact indicators;
+proc freq data=nodup_id; table near_exact_ind; run;
+
+
+*link in the unique_link flag from above to the rugby data to easily identify the "definitely" and "probably" use groups;
+******************************************************************;
+* look at the rugby ids showing duplicates in spine. Just focus on the pairs and not the triplet for now;
+data pair_dup; set spine_id; 
+where count = 2; 
+drop count percent;
+run;
+
+*link in near exact indicator;
+proc sql; 
+	create table pair_dup2 as 
+	select a.lhs_nbr as spine_id, b.rhs_nbr as rugby_id, b.near_exact_ind 
+	from pair_dup a 
+	left join rugby_links b
+	on a.lhs_nbr = b.lhs_nbr;
+quit;
+
+*see how many non-exact near-exact duplicates there are;
+proc sort data=pair_dup2; by spine_id; run;
+
+*sum indicators - those that add up to 1 are the ones that we want (as indicate 0,1 dyads);
+proc sql;
+	create table sum_ind as 
+	select spine_id, sum(near_exact_ind) as ind_sum 
+from pair_dup2
+group by spine_id;
+quit;
+
+*what are the pairings - this indicates how many are both are non-exact, how many where one is near and one is non, and how many where both are near;
+proc freq data=sum_ind; table ind_sum; run;
+*some where it's one of each and where both are non-exact. Most spine ids have links to rugby ids where both rugby ids are near exact..;
+
+*have a look at the triplet link;
+data trip_dup; set spine_id; 
+where count = 3; 
+drop count percent;
+run;
+
+*link in near exact indicator;
+proc sql; 
+	create table trip_dup2 as 
+	select a.lhs_nbr as spine_id, b.rhs_nbr as rugby_id, b.near_exact_ind 
+	from trip_dup a 
+	left join rugby_links b
+	on a.lhs_nbr = b.lhs_nbr;
+quit;
+*all near exact links - not usable;
+
+*link ind_sum variable back into pair_dup2;
+proc sql; 
+	create table pair_dup3 as 
+	select a.*,b.ind_sum 
+	from pair_dup2 a left join sum_ind b
+	on a.spine_id = b.spine_id;
+quit;
+
+*create "maybe" flag - for those with discrepant near-exact indicators, 
+the rugby id with a near exact linked is flagged as 1 (maybe) and the one with a non-exact link is flagged as 0;
+data pair_dup4; set pair_dup3; 
+if ind_sum = 1 and near_exact_ind = 1 then maybe = 1;
+else if ind_sum = 1 and near_exact_ind = 0 then maybe = 0;
+run;
+
+proc freq data=pair_dup4; table maybe; run;
+
+***************************************************************************;
+**create usability variable in rugby dataset;
+proc sql;
+	create table rugby_use as
+	select a.*,b.unique_link,c.maybe
+		from rugby_links a left join nodup_id b
+		on a.lhs_nbr = b.lhs_nbr
+				left join pair_dup4 c
+				on a.rhs_nbr = c.rugby_id;
+quit;		
+
+proc means data=rugby_use; run;
+
+proc format;
+value use_sort
+1 = "definitely"
+2 = "probably"
+3 = "maybe"
+0 = "exclude";
+run;
+
+data rugby_use2; set rugby_use;
+if unique_link = 1 and near_exact_ind = 1 then use = 1;
+else if unique_link = 1 and near_exact_ind = 0 then use = 2;
+else if maybe = 1 then use = 3;
+else use = 0;
+format use use_sort.;
+run;
+
+proc freq data=nodup_id; table near_exact_ind; run;
+proc freq data=pair_dup4; table maybe; run;
+proc freq data=rugby_use2; table use; run;
+
+proc sort data=rugby_use2; by use; run;
+proc means data=rugby_use2; 
+var weight_nbr;
+by use;
+run;
+
+*save datafile;
+data steph.RugbyOG_27Jul21; set rugby_use2; run;
+************************************************************;
+***BM, linkage paper, fig1 box 1, with 'others' included***
+
+*finalising dataset - retrict to definitely use (defined as: unique link to IDI spine [as there were some cases where two or more rugby IDs 
+were linked to the same spine id], and near exact match) and those born from 1920 onwards; 
+ data rugby_use3; set steph.RugbyOG_27Jul21; 
+ where use = 1 and birth_year_nbr ge 1920; 
+ run;
+
+ *converting variables to numeric;
+data rugby_use4; set rugby_use3; 
+first_played_year2 = first_played_year*1;
+last_played_year2 = last_played_year*1;
+ref_first_year2 = ref_first_year*1;
+ref_last_year2 = ref_last_year*1; 
+referee_ind2 = referee_ind*1; 
+
+*based on feedback from Ken, those with data "first_played_year" are considered elite players - so creating rugby indicator to identify them as rugby players;
+if first_played_year2 ne . then rugby_ind = 1;
+run;
+
+*checks;
+proc freq data=rugby_use3;
+table referee_ind first_played_year;
+run;
+
+proc freq data=rugby_use4; 
+table referee_ind2 rugby_ind;
+run;
+
+proc means data=rugby_use4; var ref_first_year2;
+run;
+
+*want to include those who were active in 1950 onwards; 
+proc means data=rugby_use4; 
+var last_played_year2 ref_last_year2; 
+run;
+
+*create an indicator for refs and rugby players who were last active in 1950 onwards using last year active variables;
+data rugby_use5; set rugby_use4;
+if last_played_year2 ge 1950 then active1950 = 1;
+else if ref_last_year2 ge 1950 then active1950 = 1;
+else active1950 = 0;
+run;
+
+*check;
+proc freq data=rugby_use5; table active1950; run;
+
+*restrict to this group and create codes for rugby player (=1) and ref only (=2); 
+data rugby_use6; set rugby_use5; 
+where active1950 = 1;
+
+if rugby_ind = 1 then rug_ref = 1; 
+else if referee_ind2 = 1 then rug_ref = 2;
+run;
+
+*check;
+proc freq data=rugby_use6; 
+table rug_ref;
+run;
+
+
+*save file - definitely use, born 1920 onwards and active 1950 onwards;
+data steph.rugbyuse_27Jul21; set rugby_use6; run;
+
+***************************************************;
+***Linkage paper, fig1 box 4***
+***These cases (rug_ref={1,2}) carry through to 'data.csv file'***
+***using 3_21_2020_Chao.sas***
+***boxes 2 & 3 can be recreated with slight change in file creation order***;
+
+***************************************************
+***************************************************
+***************************************************;
+
+
+***********************************************
+**2 LINKING RUGBY/REF CASES TO SPINE TO INCLUDE ALL IN EVER RESIDENT POPULATION
+**  ADDING
+**  A. BIRTH AND DEATH DATA (DEPARTMENT OF INTERNAL AFFAIRS, DIA)
+**  B. MORTALITY REGISTRATIONS (MINISTRY OF HEALTH DATA, MOH)
+
+**SAS CODE**
+**ORIGINAL REFRESH: idi_clean_20200120**
+**REFRESH FOR MOH & DIA DATA: idi_clean_20211020 (LINKED USING snz_moh_uid & snz_dia_uid)
+***********************************************;
+
+*Set up libraries;
+libname data ODBC dsn=idi_clean_20200120_srvprd  schema=data;
+libname security ODBC dsn=idi_clean_20200120_srvprd  schema=security; 
+libname steph "/nas/DataLab/MAA/MAA2016-21 The Health Impacts of Playing Rugby/Steph/Data";
+libname moh ODBC dsn=idi_clean_20211020_srvprd schema=moh_clean;
+libname dia ODBC dsn=idi_clean_20211020_srvprd  schema=dia_clean;
+
+
+*Moh Mortality;
+proc sql;
+	create table mor as 
+		select a.snz_moh_uid, a.moh_mor_death_month_nbr, a.moh_mor_death_year_nbr, b.snz_uid 
+		from moh.mortality_registrations a 
+        left join security.concordance b
+		on a.snz_moh_uid = b.snz_moh_uid;
+quit;
+
+
+*Dia Death;
+proc sql;
+	create table dth as 
+		select a.snz_dia_uid, a.dia_dth_death_month_nbr, a.dia_dth_death_year_nbr, a.dia_dth_death_reg_month_nbr, a.dia_dth_death_reg_year_nbr, b.snz_uid 
+		from dia.deaths a 
+        left join security.concordance b
+		on a.snz_dia_uid = b.snz_dia_uid;
+quit;
+
+
+*Dia Birth;
+proc sql;
+	create table bir as 
+		select a.snz_dia_uid, a.dia_bir_birth_month_nbr, a.dia_bir_birth_year_nbr, a.dia_bir_birth_reg_year_nbr, a.dia_bir_birth_reg_month_nbr, b.snz_uid 
+        from dia.births a 
+        left join security.concordance b
+		on a.snz_dia_uid = b.snz_dia_uid;
+quit;
+
+
+*Rugby; 
+proc sql;
+	create table rgb as 
+	    select a.*, b.snz_uid 
+		from steph.rugbyuse_27jul21 a 
+		left join security.concordance b
+		on a.lhs_nbr = b.snz_spine_uid; 
+quit;
+
+
+*Main dataset (with personal details and overseas spell);
+proc sql;
+   create table data as
+       select a.*, r.*, d.*, m.*, b.*, o.*
+       from (select c.snz_uid, c.snz_sex_code, c.snz_birth_year_nbr, c.snz_birth_month_nbr, c.snz_birth_date_proxy, c.snz_ethnicity_grp1_nbr, c.snz_ethnicity_grp2_nbr, 
+                    c.snz_ethnicity_grp3_nbr, c.snz_ethnicity_grp4_nbr, c.snz_ethnicity_grp5_nbr, c.snz_ethnicity_grp6_nbr, c.snz_deceased_year_nbr, c.snz_deceased_month_nbr 
+             from data.personal_detail c
+             where c.snz_spine_ind = 1) a
+       left join rgb r
+       on a.snz_uid = r.snz_uid
+       left join dth d
+       on a.snz_uid = d.snz_uid
+       left join mor m
+       on a.snz_uid = m.snz_uid
+       left join bir b
+       on a.snz_uid = b.snz_uid
+       left join (select e.*
+                  from data.person_overseas_spell e
+                  where e.pos_last_departure_ind = 'y') o
+       on a.snz_uid = o.snz_uid;
+
+quit;
+
+
+*Save CSV;
+proc export data=data dbms=csv
+outfile="/nas/DataLab/MAA/MAA2016-21 The Health Impacts of Playing Rugby/Chao/Data/data.csv";
+run;
+
+
+***************************************************
+***************************************************;
+
+***********************************************
+**3 CLEANING DATA
+**  DROPPING
+**  A. DUPLICATES 
+**  B. FEMALES, ACCORDING TO PERSONAL_DETAIL TABLE (INCL RUGBY/REF CASES WITH INCONSISTENT GENDER)
+**  C. RUGBY/REF CASES WITH RUGBY/REF BIRTH YEARS AND PERSONAL_DETAIL BIRTH YEARS DISCREPANT BY >1 YEAR
+**  D. RUGBY PLAYERS UNDER 18 IN FINAL YEAR OF PLAY
+**  E. GENPOP CASES BORN<1920 OR >1984
+**  F. ALL CASES WHO DIED PRIOR TO AGE 30
+**  G. ALL CASES WHO LEFT NZ PRIOR TO AGE 30 
+**  H. REFEREES
+**  I. CASES UNABLE TO BE MATCHED BY NZBORN, BIRTHYEAR GROUP, AND ETHNICITY
+
+**STATA CODE**
+***********************************************;
+
+import delimited "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\data.csv"
+
+
+*** A check for duplicates
+tab rug_ref, missing
+codebook snz_uid
+codebook snz_uid if rug_ref!=.
+codebook snz_uid if rug_ref==1
+codebook snz_uid if rug_ref==2
+
+duplicates list snz_uid if rug_ref==1
+
+list snz_uid-pos_source_code if snz_uid==XXXXXXXX
+
+duplicates report snz_uid
+
+* drop duplicates
+duplicates drop snz_uid, force
+codebook snz_uid
+
+*** all cases after duplicates dropped
+tab rug_ref, missing
+
+
+
+*** B gender constraint, dropping female cases (incl rugby players and referees with inconsistent genders)
+tab rug_ref, missing
+tab snz_sex_code
+tab snz_sex_code if rug_ref!=.
+
+drop if snz_sex_code==2
+
+* all cases after gender constraint
+tab rug_ref, missing
+
+
+
+*** C rugby birth year discrepant to personal detail birth year, dropping
+tab birth_year_nbr
+tab snz_birth_year_nbr
+
+gen diff=birth_year_nbr-snz_birth_year_nbr
+tab diff, missing nolabel
+
+drop if diff<-1 | (diff>1 & diff<=20)
+tab diff, missing nolabel
+drop diff
+
+* rugby players and referees after birth year constraint
+tab rug_ref
+
+
+
+*** D last play must be older than 18, dropping otherwise
+
+tab age_last_played_nbr
+tab last_played_year
+gen diff=last_played_year-snz_birth_year_nbr
+tab diff, missing nolabel
+list last_played_year snz_birth_year_nbr if diff<18
+drop if diff<18
+tab diff, missing nolabel
+drop diff
+
+* rugby players and referees after age 18 constraint
+tab rug_ref
+
+
+
+*** E general population born 1920-1984, dropping otherwise
+tab snz_birth_year_nbr if rug_ref==.
+tab rug_ref if snz_birth_year_nbr<1920
+tab rug_ref if snz_birth_year_nbr>1984
+drop if snz_birth_year_nbr<1920
+drop if snz_birth_year_nbr>1984
+
+* genpop after born 1920-1984 constraint
+tab snz_birth_year_nbr if rug_ref==.
+
+
+
+*** F died before age 30, dropping
+
+* NZ Born
+tab dia_bir_birth_year_nbr, missing nolabel
+gen nzborn=1 if dia_bir_birth_year_nbr!=.
+replace nzborn=0 if dia_bir_birth_year_nbr==.
+tab nzborn, missing nolabel
+
+* start date
+gen stdate=mdy(snz_birth_month_nbr,15,snz_birth_year_nbr+30)
+format stdate %td
+
+* left country date
+gen lcday=substr(pos_applied_date,1,9)
+gen lcdate=date(lcday,"DMY")
+format lcdate %td
+
+* death date
+gen dthdate=mdy(snz_deceased_month_nbr,15,snz_deceased_year_nbr)
+format dthdate %td
+
+* birth date
+gen birdate=date(snz_birth_date_proxy,"DMY")
+format birdate %td
+
+* no death before 30th birthday, dropping
+gen diff=(dthdate-birdate)/365.25
+tab diff, missing nolabel
+tab diff if diff<30
+tab diff if diff<=30
+tab diff if dthdate<=stdate
+drop if dthdate<=stdate
+drop diff
+
+* no players' death before last play year, dropping
+gen diff=snz_deceased_year_nbr-last_played_year if rug_ref==1
+tab diff
+drop if diff<0
+
+* genpop after born died before age 30 constraint
+tab rug_ref, missing
+
+
+
+*** G left nz before age 30, dropping (also adding variables for survival analysis)
+
+* end date
+gen endate=mdy(12,31,2018)
+format endate %td
+replace endate=lcdate if lcdate!=. & lcdate<endate
+replace endate=dthdate if lcdate!=. & dthdate!=. & dthdate<endate & lcdate<endate & dthdate<lcdate
+replace endate=dthdate if lcdate==. & dthdate!=. & dthdate<endate
+
+
+* death in dataset
+gen dth=1 if snz_deceased_year_nbr!=.
+replace dth=0 if snz_deceased_year_nbr==.
+
+tab dth, missing nolabel
+tab snz_deceased_year_nbr, missing nolabel
+
+tab dth if rug_ref==1
+tab dth rug_ref
+
+* death in observation period, for survival analysis and COX model (censored out those left NZ before death or beofre end of observation period, as not dead)
+gen death=0
+replace death=1 if endate==dthdate
+
+tab death, missing nolabel
+
+tab death if rug_ref==1
+tab death rug_ref
+
+
+* time (in days) to death/left NZ/end of observation period (whicherver the earliest), for survival analysis and COX model
+gen days=endate-stdate
+*tab days, missing nolabel
+
+sum days
+sum days if days<0
+sum lcdate if days<0
+sum dthdate if days<0
+list dthdate stdate birdate endate if dthdate!=. & days<0
+list dthdate stdate birdate endate lcdate if dthdate!=. & days<0
+sum days if days==0
+list dthdate stdate birdate endate lcdate if days==0
+list dthdate stdate birdate endate lcdate death if dthdate!=. & days<0
+sum death if days<0
+sum death if days<=0
+
+* drop those left nz earlier than/on 30th birthday
+tab rug_ref if days<=0
+drop if days<=0
+
+tab rug_ref, missing
+
+
+*** H dropping referees, just rugby players (1) and gen-pop (0) in dataset
+
+* rugby players only, dropping referees
+drop if rug_ref==2
+replace rug_ref=0 if rug_ref==.
+tab rug_ref, missing 
+
+
+
+*** I matching to compute weights (w), dropping those without a match
+* psmatch2
+
+tab rug_ref, missing nolabel
+tab nzborn, missing nolabel
+
+*creating birth year 
+tab snz_birth_year_nbr, missing nolabel
+gen byg=1 if snz_birth_year_nbr<=1924
+replace byg=2 if snz_birth_year_nbr>=1925 & snz_birth_year_nbr<=1929
+replace byg=3 if snz_birth_year_nbr>=1930 & snz_birth_year_nbr<=1934
+replace byg=4 if snz_birth_year_nbr>=1935 & snz_birth_year_nbr<=1939
+replace byg=5 if snz_birth_year_nbr>=1940 & snz_birth_year_nbr<=1944
+replace byg=6 if snz_birth_year_nbr>=1945 & snz_birth_year_nbr<=1949
+replace byg=7 if snz_birth_year_nbr>=1950 & snz_birth_year_nbr<=1954
+replace byg=8 if snz_birth_year_nbr>=1955 & snz_birth_year_nbr<=1959
+replace byg=9 if snz_birth_year_nbr>=1960 & snz_birth_year_nbr<=1964
+replace byg=10 if snz_birth_year_nbr>=1965 & snz_birth_year_nbr<=1969
+replace byg=11 if snz_birth_year_nbr>=1970 & snz_birth_year_nbr<=1974
+replace byg=12 if snz_birth_year_nbr>=1975 & snz_birth_year_nbr<=1979
+replace byg=13 if snz_birth_year_nbr>=1980 & snz_birth_year_nbr<=1984
+tab byg, missing nolabel
+
+
+tab snz_ethnicity_grp1_nbr, missing nolabel
+tab snz_ethnicity_grp2_nbr, missing nolabel
+tab snz_ethnicity_grp3_nbr, missing nolabel
+tab snz_ethnicity_grp4_nbr, missing nolabel
+
+
+tab1 rug_ref nzborn byg snz_ethnicity_grp1_nbr snz_ethnicity_grp2_nbr snz_ethnicity_grp3_nbr snz_ethnicity_grp4_nbr
+
+
+* add own ado path
+
+adopath +"I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\ado"
+
+psmatch2 rug_ref nzborn byg snz_ethnicity_grp1_nbr snz_ethnicity_grp2_nbr snz_ethnicity_grp3_nbr snz_ethnicity_grp4_nbr, out(dth) kernel mahal(nzborn byg snz_ethnicity_grp1_nbr snz_ethnicity_grp2_nbr snz_ethnicity_grp3_nbr snz_ethnicity_grp4_nbr)
+
+pstest nzborn byg snz_ethnicity_grp1_nbr snz_ethnicity_grp2_nbr snz_ethnicity_grp3_nbr snz_ethnicity_grp4_nbr
+
+codebook _weight
+
+
+sum _weight
+sum _weight if rug_ref==1
+sum _weight if rug_ref==0
+
+sum _weight, detail
+sum _weight if rug_ref==1, detail
+sum _weight if rug_ref==0, detail
+
+** scale controls' weights up to have mean==1 (follow the practice in MatchIt full matching in R)
+
+sum _weight if rug_ref==0
+display r(sum)
+display r(N)
+global r r(N)/r(sum)
+display $r
+
+gen w=_weight
+replace w=w*$r if rug_ref==0
+
+sum w
+sum w if rug_ref==1
+sum w if rug_ref==0
+
+sum w, detail
+sum w if rug_ref==1, detail
+sum w if rug_ref==0, detail
+
+codebook w
+
+* drop unmatched, 
+drop if w==.
+
+save "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\data3.dta", replace
+
+
+***************************************************
+***************************************************;
+
+***********************************************
+**4 DROPPING THOSE WHO DIED BEFORE 1988 (WHEN MOH CAUSE OF DEATH RECORDS BEGIN)
+**  REDOING WEIGHTS FOR THOSE ALIVE>1988 (w2)
+
+**STATA CODE**
+***********************************************;
+
+
+***flagging those still alive in 1988
+clear
+use "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\data3.dta"
+
+gen subsample=1 
+replace subsample=0 if snz_deceased_year_nbr<1988 & snz_deceased_year_nbr!=.
+replace subsample=0 if moh_mor_death_year_nbr<1988 & moh_mor_death_year_nbr!=.
+
+
+tab rug_ref
+
+
+***redoing weights for those subsample==1 & keeping those subsample==1 (still alive in 1988)***
+
+psmatch2 rug_ref nzborn byg snz_ethnicity_grp1_nbr snz_ethnicity_grp2_nbr snz_ethnicity_grp3_nbr snz_ethnicity_grp4_nbr if subsample==1, out(dth) kernel mahal(nzborn byg snz_ethnicity_grp1_nbr snz_ethnicity_grp2_nbr snz_ethnicity_grp3_nbr snz_ethnicity_grp4_nbr)
+
+pstest nzborn byg snz_ethnicity_grp1_nbr snz_ethnicity_grp2_nbr snz_ethnicity_grp3_nbr snz_ethnicity_grp4_nbr if subsample==1
+
+* scale controls' weights up to have mean==1 (follow the practice in MatchIt full matching in R)
+
+sum _weight if rug_ref==0
+display r(sum)
+display r(N)
+global r r(N)/r(sum)
+display $r
+
+gen w2=_weight
+replace w2=w2*$r if rug_ref==0
+
+sum w2
+sum w2 if rug_ref==1
+sum w2 if rug_ref==0
+
+sum w2, detail
+sum w2 if rug_ref==1, detail
+sum w2 if rug_ref==0, detail
+
+keep if w2!=.
+
+save "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\data4.dta"
+***has all the impt vars that data6e has***
+
+
+
+***************************************************
+***************************************************;
+
+***********************************************
+**5 ADDING DEATH VARS
+    VAR CODING TIME SINCE FOLLOW-UP FROM AGE 30
+    CATEGORISED YEARS PLAYED AND GAMES PLAYED VARS
+
+**STATA CODE**
+***********************************************;
+
+use "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\data4.dta", clear
+
+
+gen tdth=0
+replace tdth=1 if dthdate!=.
+
+tab tdth rug_ref
+tab tdth rug_ref [aweight=w2]
+
+***death from one of the 8 causes
+gen tdth8=0
+replace tdth8=1 if neuro==1
+replace tdth8=1 if cvd==1
+replace tdth8=1 if cancer==1
+replace tdth8=1 if suic==1
+replace tdth8=1 if asud==1
+replace tdth8=1 if met==1
+replace tdth8=1 if rsp==1
+replace tdth8=1 if dgs==1
+
+tab tdth8 rug_ref
+tab tdth8 rug_ref [aweight=w2]
+
+
+***** new censoring
+
+gen age_30_rp=mdy(1,1,1988)
+format age_30_rp %td
+
+replace days = endate - age_30_rp if stdate<age_30_rp
+
+replace daysy=days/365.25
+
+
+codebook daysy
+
+* follow-up period - iweight not allowed for sum
+
+sum daysy, detail
+sum daysy if rug_ref==1, detail
+sum daysy if rug_ref==0, detail
+
+sum daysy [aweight=w2], detail
+sum daysy [aweight=w2] if rug_ref==1, detail
+sum daysy [aweight=w2] if rug_ref==0, detail
+
+
+***** years and games pLayed
+
+tab years_played_count, missing
+tab rug_ref, missing
+gen ypg=0 if rug_ref==0
+replace ypg=1 if years_played_count==1
+replace ypg=2 if inrange(years_played_count,2,5)
+replace ypg=3 if years_played_count>5 & years_played_count!=.
+tab ypg, missing
+
+tab career_games, missing
+tab rug_ref, missing
+gen ng=0 if rug_ref==0
+replace ng=1 if inrange(career_games,1,4)
+replace ng=2 if inrange(career_games,5,20)
+replace ng=3 if career_games>20 & career_games!=.
+tab ng, missing
+
+save "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\data8a2.dta"
+
+
+
+
+
+***************************************************
+***************************************************;
+
+***********************************************
+**6 CAUSE OF DEATH
+
+**SAS & STATA CODE**
+***********************************************;
+
+
+**SAS CODE**
+**ORIGINAL REFRESH: idi_clean_20200120**
+**ADDING MORTALITY RECORDS USING idi_clean_202406 REFRESH USING snz_moh_uid**
+
+
+libname moh ODBC dsn=idi_clean_202406_srvprd schema=moh_clean;
+libname Chao "/nas/DataLab/MAA/MAA2016-21 The Health Impacts of Playing Rugby/Chao/Data";
+libname security ODBC dsn=idi_sandpit_srvprd schema="DL-MAA2019-101";
+
+* base dataset;
+proc import out=snzuid 
+datafile="/nas/DataLab/MAA/MAA2016-21 The Health Impacts of Playing Rugby/Chao/Data/data8a2.dta";
+run;
+
+data snzuid; set snzuid; 
+keep snz_uid; 
+run;
+
+* mohuid;
+proc sql; 
+    create table mohuid as 
+        select a.*, b.snz_moh_uid
+        from snzuid a 
+        left join security.concordance_20200120 b
+        on a.snz_uid = b.snz_uid; 
+quit;
+
+proc sql;
+   create table mort20 as
+       select a.*, b.*, c.*
+       from mohuid a
+       inner join (select d.snz_moh_uid, d.snz_dia_death_reg_uid, d.moh_mor_death_month_nbr, d.moh_mor_death_year_nbr
+                  from moh.mortality_registrations d) b
+       on a.snz_moh_uid = b.snz_moh_uid
+       inner join (select e.snz_dia_death_reg_uid, e.moh_mort_diag_clinical_code, e.moh_mort_diag_clinic_type_code, e.moh_mort_diag_clinic_sys_code, e.moh_mort_diag_diag_type_code
+                  from moh.mortality_diagnosis e) c
+       on b.snz_dia_death_reg_uid = c.snz_dia_death_reg_uid;
+quit;
+
+data Chao.mort20; set mort20; run;
+
+
+**STATA**
+use "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\data8a2.dta"
+
+
+* other ethnicity
+gen oeth=0
+replace oeth=1 if snz_ethnicity_grp4_nbr==1 | snz_ethnicity_grp5_nbr==1 | snz_ethnicity_grp6_nbr==1
+tab oeth, missing
+
+save "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20.dta"
+
+clear
+
+* mortality new
+
+import sas using "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20.sas7bdat"
+
+
+********************
+**** icd causes ****
+********************
+
+
+* icd 9 and icd 10
+tab moh_mor_death_year_nbr, missing
+tab moh_mort_diag_clinic_sys_code, missing
+tab moh_mort_diag_diag_type_code, missing
+
+gen icd9=1 if moh_mort_diag_clinic_sys_code=="06"
+replace icd9=0 if inlist(moh_mort_diag_clinic_sys_code,"10","11","12","13","14","15")
+tab icd9, missing
+
+* main cause - mortality registration = D underlying cause diagnosis
+
+sort snz_uid
+
+
+* ICD
+gen icd1=substr(moh_mort_diag_clinical_code,1,1)
+gen icd_23=substr(moh_mort_diag_clinical_code,2,2)
+gen icd_45=substr(moh_mort_diag_clinical_code,4,2)
+gen icd_4=substr(moh_mort_diag_clinical_code,4,1)
+gen icd_5=substr(moh_mort_diag_clinical_code,5,1)
+
+destring icd_23, gen(icd23)
+destring icd_4, gen(icd4)
+destring icd_5, gen(icd5)
+destring icd_45, gen(icd45)
+
+* combinatin of icd9 and icd10, has v and z code
+tab icd1, missing
+
+
+********************************************
+**** NeurodegeneratiVe disease mortality ****
+********************************************
+
+* diagnosis all causes
+
+gen neuro=1 if icd1=="2" & icd23==90 & icd9==1
+replace neuro=1 if icd1=="2" & icd23==91 & icd4==2 & icd9==1
+replace neuro=1 if icd1=="2" & icd23==92 & icd45==82 & icd9==1
+replace neuro=1 if icd1=="2" & icd23==94 & icd4==1 & icd9==1
+replace neuro=1 if icd1=="3" & icd23==31 & inlist(icd4,0,1,2) & icd9==1
+replace neuro=1 if icd1=="3" & icd23==32 & icd9==1
+replace neuro=1 if icd1=="3" & icd23==33 & icd45==92 & icd9==1
+replace neuro=1 if icd1=="3" & icd23==35 & icd4==2 & icd9==1
+
+replace neuro=1 if icd1=="F" & icd23==0 & icd9==0
+replace neuro=1 if icd1=="F" & icd23==1 & icd9==0
+replace neuro=1 if icd1=="F" & icd23==2 & icd9==0
+replace neuro=1 if icd1=="F" & icd23==3 & icd9==0
+replace neuro=1 if icd1=="F" & icd23==5 & icd4==1 & icd9==0
+replace neuro=1 if icd1=="F" & icd23==10 & icd4==7 & icd9==0
+replace neuro=1 if icd1=="F" & icd23==13 & icd4==7 & icd9==0
+replace neuro=1 if icd1=="F" & icd23==18 & icd4==7 & icd9==0
+replace neuro=1 if icd1=="F" & icd23==19 & icd4==7 & icd9==0
+replace neuro=1 if icd1=="G" & icd23==30 & icd9==0
+replace neuro=1 if icd1=="G" & icd23==31 & inlist(icd4,0,1,2) & icd9==0
+replace neuro=1 if icd1=="G" & icd23==20 & icd9==0
+replace neuro=1 if icd1=="G" & icd23==21 & icd9==0
+replace neuro=1 if icd1=="G" & icd23==22 & icd9==0
+replace neuro=1 if icd1=="G" & icd23==12 & icd4==2 & icd9==0
+
+
+* diagnosis D/registration main/underlying cause
+
+gen neurom=neuro
+replace neurom=. if moh_mort_diag_diag_type_code!="D"
+
+
+****************************************
+**** Cardiovascular (CVD) mortality ****
+****************************************
+
+* diagnosis all causes
+
+gen cvd=1 if icd1=="4" & icd23==10 & inlist(icd45,11,41,71,81,91) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==11 & inlist(icd45,81,89) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==11 & icd4==1 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==13 & inlist(icd4,1,9) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==14 & inlist(icd45,11,19) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==14 & icd4==8 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==27 & icd4==5 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==29 & inlist(icd4,2,5,6) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==29 & inlist(icd45,71,79) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==23 & icd4==0 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==33 & inlist(icd45,0,10,20,30,80,90,91) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==34 & inlist(icd45,0,1,11,90,91) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==36 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==37 & inlist(icd4,0,6,8,9) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==30 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==31 & icd9==1
+replace cvd=1 if icd1=="3" & icd23==62 & icd45==34 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==35 & inlist(icd4,3,8,9) & icd9==1
+replace cvd=1 if icd1=="2" & icd23==50 & inlist(icd45,70,72,73) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==40 & inlist(icd45,20,21,22,23,24) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==41 & inlist(icd45,0,1,2,3) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==41 & inlist(icd4,1,3,4,5,6) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==43 & icd4==9 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==44 & inlist(icd4,0,1,9) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==44 & inlist(icd45,21,22,81,89) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==2 & icd45==91 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==4 & inlist(icd45,91,93) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==5 & icd45==91 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==12 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==14 & inlist(icd45,0,1,2,3) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==14 & inlist(icd4,8,9) & icd9==1
+replace cvd=1 if icd1=="4" & icd23==38 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==59 & icd4==9 & icd9==1
+replace cvd=1 if icd1=="4" & icd23==40 & inlist(icd4,0,1,8,9) & icd9==1
+replace cvd=1 if icd1=="V" & icd23==45 & inlist(icd45,81,82) & icd9==1
+replace cvd=1 if icd1=="V" & icd23==34 & icd4==2 & icd9==1
+
+replace cvd=1 if icd1=="Z" & icd23==95 & icd4==1 & icd9==0
+replace cvd=1 if icd1=="Z" & icd23==95 & icd4==5 & icd9==0
+replace cvd=1 if icd1=="Z" & icd23==95 & icd4==8 & icd9==0
+replace cvd=1 if icd1=="Z" & icd23==95 & icd4==9 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==21 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==22 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==20 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==23 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==24 & inlist(icd4,0,8,9) & icd9==0
+replace cvd=1 if icd1=="I" & icd23==25 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==46 & inlist(icd4,0,1,9) & icd9==0
+replace cvd=1 if icd1=="I" & icd23==63 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==64 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==60 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==61 & icd9==0
+replace cvd=1 if icd1=="G" & icd23==45 & inlist(icd4,0,1,2,3,8) & icd9==0
+replace cvd=1 if icd1=="G" & icd23==46 & icd9==0
+replace cvd=1 if icd1=="E" & icd23==10 & inlist(icd45,51,52,59) & icd9==0
+replace cvd=1 if icd1=="E" & icd23==11 & inlist(icd45,50,51,52,59) & icd9==0
+replace cvd=1 if icd1=="E" & icd23==14 & inlist(icd45,51,52,59) & icd9==0
+replace cvd=1 if icd1=="I" & icd23==70 & inlist(icd45,20,21,24) & icd9==0
+replace cvd=1 if icd1=="I" & icd23==71 & inlist(icd4,0,1,3,4,5,8) & icd9==0
+replace cvd=1 if icd1=="I" & icd23==73 & icd4==9 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==74 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==11 & icd4==0 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==13 & inlist(icd4,0,2) & icd9==0
+replace cvd=1 if icd1=="I" & icd23==50 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==65 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==66 & icd9==0
+replace cvd=1 if icd1=="I" & icd23==67 & inlist(icd4,0,2) & icd9==0
+replace cvd=1 if icd1=="I" & icd23==69 & inlist(icd4,0,1,3,4,8) & icd9==0
+replace cvd=1 if icd1=="I" & icd23==70 & inlist(icd4,0,1,2,8,9) & icd9==0
+
+* diagnosis D/registration main/underlying cause
+
+gen cvdm=cvd
+replace cvdm=. if moh_mort_diag_diag_type_code!="D"
+
+
+
+**************************
+**** Cancer mortality ****
+**************************
+
+* diagnosis all causes
+
+gen cancer=1 if icd1=="1" & inrange(icd23,40,99) & icd9==1
+replace cancer=1 if icd1=="2" & inrange(icd23,0,8) & icd9==1
+
+replace cancer=1 if icd1=="C" & inrange(icd23,0,96) & icd9==0
+replace cancer=1 if icd1=="D" & inrange(icd23,45,47) & icd9==0
+
+* diagnosis D/registration main/underlying cause
+
+gen cancerm=cancer
+replace cancerm=. if moh_mort_diag_diag_type_code!="D"
+
+
+
+***************************
+**** Suicide mortality ****
+***************************
+
+* diagnosis all causes
+
+gen suic=1 if icd1=="9" & inrange(icd23,50,59) & icd9==1
+
+replace suic=1 if icd1=="X" & inrange(icd23,60,84) & icd9==0
+replace suic=1 if icd1=="Y" & icd23==87 & icd4==0 & icd9==0
+
+* diagnosis D/registration main/underlying cause
+
+gen suicm=suic
+replace suicm=. if moh_mort_diag_diag_type_code!="D"
+
+
+***************************************
+**** Alcohol/SUD-related mortality ****
+***************************************
+
+* diagnosis all causes
+
+gen asud=1 if icd1=="5" & icd23==71 & icd9==1
+replace asud=1 if icd1=="8" & inrange(icd23,50,60) & icd9==1
+replace asud=1 if icd1=="9" & icd23==80 & icd9==1
+
+replace asud=1 if icd1=="K" & inlist(icd23,70,73,74) & icd9==0
+replace asud=1 if icd1=="X" & inrange(icd23,40,45) & icd9==0
+replace asud=1 if icd1=="Y" & inrange(icd23,10,15) & icd9==0
+replace asud=1 if icd1=="Y" & inlist(icd23,45,47,49) & icd9==0
+
+* diagnosis D/registration main/underlying cause
+
+gen asudm=asud
+replace asudm=. if moh_mort_diag_diag_type_code!="D"
+
+*******************************************************
+**** Endocrine, Nutritional and Metabolic Diseases ****
+*******************************************************
+
+* diagnosis all causes
+
+gen met=1 if icd1=="2" & inrange(icd23,40,79) & icd9==1
+
+replace met=1 if icd1=="E" & inrange(icd23,0,90) & icd9==0
+
+
+* diagnosis D/registration main/underlying cause
+
+gen metm=met
+replace metm=. if moh_mort_diag_diag_type_code!="D"
+
+
+********************************************
+**** Diseases of the Respiratory System ****
+********************************************
+
+* diagnosis all causes
+
+gen rsp=1 if icd1=="4" & inrange(icd23,60,66) & icd9==1
+replace rsp=1 if icd1=="4" & inrange(icd23,70,78) & icd9==1
+replace rsp=1 if icd1=="4" & inrange(icd23,80,87) & icd9==1
+replace rsp=1 if icd1=="4" & inrange(icd23,90,96) & icd9==1
+replace rsp=1 if icd1=="5" & inrange(icd23,0,19) & icd9==1
+replace rsp=1 if icd1=="0" & icd23==34 & icd4==0 & icd9==1
+
+replace rsp=1 if icd1=="J" & inrange(icd23,0,99) & icd9==0
+
+
+* diagnosis D/registration main/underlying cause
+
+gen rspm=rsp
+replace rspm=. if moh_mort_diag_diag_type_code!="D"
+
+
+******************************************
+**** Diseases of the Digestive System ****
+******************************************
+
+* diagnosis all causes
+
+gen dgs=1 if icd1=="5" & inrange(icd23,20,79) & icd9==1
+
+replace dgs=1 if icd1=="K" & inrange(icd23,0,93) & icd9==0
+
+
+* diagnosis D/registration main/underlying cause
+
+gen dgsm=dgs
+replace dgsm=. if moh_mort_diag_diag_type_code!="D"
+
+
+****************************
+**** All other diseases ****
+****************************
+
+* diagnosis all causes
+
+gen other=1
+
+replace other=. if inlist(1,neuro,cvd,cancer,suic,asud,met,rsp,dgs)
+
+
+* diagnosis D/registration main/underlying cause
+
+gen otherm=1 if moh_mort_diag_diag_type_code=="D"
+replace otherm=. if inlist(1,neurom,cvdm,cancerm,suicm,asudm,metm,rspm,dgsm)
+
+save "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20a.dta"
+
+* collapse to individual levels
+
+collapse (firstnm) moh_mor_death_month_nbr moh_mor_death_year_nbr neuro-otherm, by(snz_uid)
+
+merge 1:1 snz_uid using "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20.dta"
+
+drop _merge
+
+save "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20.dta", replace
+
+
+
+***************************************************
+***************************************************;
+
+***********************************************
+**7 DATES FOR SURVIVAL ANALYSIS
+
+**STATA CODE**
+***********************************************;
+
+** start date
+replace stdate=mdy(snz_birth_month_nbr,15,snz_birth_year_nbr+30)
+format stdate %td
+
+** left country date
+replace lcday=substr(pos_applied_date,1,9)
+replace lcdate=date(lcday,"DMY")
+format lcdate %td
+
+**** death date
+replace dthdate=mdy(moh_mor_death_month_nbr,15,moh_mor_death_year_nbr)
+format dthdate %td
+
+** birth date
+replace birdate=date(snz_birth_date_proxy,"DMY")
+format birdate %td
+
+**** no death before 30th birthday
+codebook snz_uid if dthdate<stdate
+list snz_uid rug_ref snz_deceased_year_nbr snz_deceased_month_nbr lcdate dthdate stdate birdate endate if dthdate<stdate
+replace stdate=mdy(3,15,1980) if dthdate<stdate
+list snz_uid rug_ref snz_deceased_year_nbr snz_deceased_month_nbr lcdate dthdate stdate birdate endate if dthdate<stdate
+list snz_uid rug_ref stdate birdate endate in 1/10
+
+***** no players' death before last play year
+codebook snz_uid if moh_mor_death_year_nbr<last_played_year & rug_ref==1
+
+**** end date
+sum dthdate, format
+replace endate=mdy(12,15,2020)
+format endate %td
+replace endate=lcdate if lcdate!=. & lcdate<endate
+replace endate=dthdate if dthdate!=. & dthdate<endate
+
+* censored
+gen dneuro=0
+replace dneuro=1 if endate==dthdate & neuro==1
+gen dneurom=0
+replace dneurom=1 if endate==dthdate & neurom==1
+gen dcvd=0
+replace dcvd=1 if endate==dthdate & cvd==1
+gen dcvdm=0
+replace dcvdm=1 if endate==dthdate & cvdm==1
+gen dcancer=0
+replace dcancer=1 if endate==dthdate & cancer==1
+gen dcancerm=0
+replace dcancerm=1 if endate==dthdate & cancerm==1
+gen dsuic=0
+replace dsuic=1 if endate==dthdate & suic==1
+gen dsuicm=0
+replace dsuicm=1 if endate==dthdate & suicm==1
+gen dasud=0
+replace dasud=1 if endate==dthdate & asud==1
+gen dasudm=0
+replace dasudm=1 if endate==dthdate & asudm==1
+gen dmet=0
+replace dmet=1 if endate==dthdate & met==1
+gen dmetm=0
+replace dmetm=1 if endate==dthdate & metm==1
+gen drsp=0
+replace drsp=1 if endate==dthdate & rsp==1
+gen drspm=0
+replace drspm=1 if endate==dthdate & rspm==1
+gen ddgs=0
+replace ddgs=1 if endate==dthdate & dgs==1
+gen ddgsm=0
+replace ddgsm=1 if endate==dthdate & dgsm==1
+gen dother=0
+replace dother=1 if endate==dthdate & other==1
+gen dotherm=0
+replace dotherm=1 if endate==dthdate & otherm==1
+
+* uncensored
+replace neuro=0 if neuro==.
+replace neurom=0 if neurom==.
+replace cvd=0 if cvd==.
+replace cvdm=0 if cvdm==.
+replace cancer=0 if cancer==.
+replace cancerm=0 if cancerm==.
+replace suic=0 if suic==.
+replace suicm=0 if suicm==.
+replace asud=0 if asud==.
+replace asudm=0 if asudm==.
+replace met=0 if met==.
+replace metm=0 if metm==.
+replace rsp=0 if rsp==.
+replace rspm=0 if rspm==.
+replace dgs=0 if dgs==.
+replace dgsm=0 if dgsm==.
+replace other=0 if other==.
+replace otherm=0 if otherm==.
+
+**** time (in days) to death/left NZ/end of observation period (whicherver the earliest), for survival analysis and COX model
+replace days=endate-stdate
+codebook snz_uid if days<0
+
+save "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20.dta", replace
+
+
+***************************************************
+***************************************************;
+
+***********************************************
+**8 COMPETING RISK DATA SETUP
+
+**STATA CODE**
+***********************************************;
+
+
+*********************************************
+**** Neurodegenerative disease mortality ****
+*********************************************
+
+gen fneurom=0
+replace fneurom=1 if dneurom==1
+replace fneurom=2 if dneurom==0 & (dcvdm==1 | dcancerm==1 | dsuicm==1 | dasudm==1 | dmetm==1 | drspm==1 | ddgsm==1 | dotherm==1)
+
+gen fneuro=0
+replace fneuro=1 if dneuro==1
+replace fneuro=2 if dneuro==0 & (dcvd==1 | dcancer==1 | dsuic==1 | dasud==1 | dmet==1 | drsp==1 | ddgs==1 | dother==1)
+
+****************************************
+**** Cardiovascular (CVD) mortality ****
+****************************************
+
+gen fcvdm=0
+replace fcvdm=1 if dcvdm==1
+replace fcvdm=2 if dcvdm==0 & (dneurom==1 | dcancerm==1 | dsuicm==1 | dasudm==1 | dmetm==1 | drspm==1 | ddgsm==1 | dotherm==1)
+
+gen fcvd=0
+replace fcvd=1 if dcvd==1
+replace fcvd=2 if dcvd==0 & (dneuro==1 | dcancer==1 | dsuic==1 | dasud==1 | dmet==1 | drsp==1 | ddgs==1 | dother==1)
+
+**************************
+**** Cancer mortality ****
+**************************
+
+gen fcancerm=0
+replace fcancerm=1 if dcancerm==1
+replace fcancerm=2 if dcancerm==0 & (dneurom==1 | dcvdm==1 | dsuicm==1 | dasudm==1 | dmetm==1 | drspm==1 | ddgsm==1 | dotherm==1)
+
+gen fcancer=0
+replace fcancer=1 if dcancer==1
+replace fcancer=2 if dcancer==0 & (dneuro==1 | dcvd==1 | dsuic==1 | dasud==1 | dmet==1 | drsp==1 | ddgs==1 | dother==1)
+
+***************************
+**** Suicide mortality ****
+***************************
+
+gen fsuicm=0
+replace fsuicm=1 if dsuicm==1
+replace fsuicm=2 if dsuicm==0 & (dneurom==1 | dcvdm==1 | dcancerm==1 | dasudm==1 | dmetm==1 | drspm==1 | ddgsm==1 | dotherm==1)
+
+gen fsuic=0
+replace fsuic=1 if dsuic==1
+replace fsuic=2 if dsuic==0 & (dneuro==1 | dcvd==1 | dcancer==1 | dasud==1 | dmet==1 | drsp==1 | ddgs==1 | dother==1)
+
+***************************************
+**** Alcohol/SUD-related mortality ****
+***************************************
+
+gen fasudm=0
+replace fasudm=1 if dasudm==1
+replace fasudm=2 if dasudm==0 & (dneurom==1 | dcvdm==1 | dcancerm==1 | dsuicm==1 | dmetm==1 | drspm==1 | ddgsm==1 | dotherm==1)
+
+gen fasud=0
+replace fasud=1 if dasud==1
+replace fasud=2 if dasud==0 & (dneuro==1 | dcvd==1 | dcancer==1 | dsuic==1 | dmet==1 | drsp==1 | ddgs==1 | dother==1)
+
+*******************************************************
+**** Endocrine, Nutritional and Metabolic Diseases ****
+*******************************************************
+
+gen fmetm=0
+replace fmetm=1 if dmetm==1
+replace fmetm=2 if dmetm==0 & (dcvdm==1 | dcancerm==1 | dsuicm==1 | dasudm==1 | dneurom==1 | drspm==1 | ddgsm==1 | dotherm==1)
+
+gen fmet=0
+replace fmet=1 if dmet==1
+replace fmet=2 if dmet==0 & (dcvd==1 | dcancer==1 | dsuic==1 | dasud==1 | dneuro==1 | drsp==1 | ddgs==1 | dother==1)
+
+********************************************
+**** Diseases of the Respiratory System ****
+********************************************
+
+gen frspm=0
+replace frspm=1 if drspm==1
+replace frspm=2 if drspm==0 & (dcvdm==1 | dcancerm==1 | dsuicm==1 | dasudm==1 | dmetm==1 | dneurom==1 | ddgsm==1 | dotherm==1)
+
+gen frsp=0
+replace frsp=1 if drsp==1
+replace frsp=2 if drsp==0 & (dcvd==1 | dcancer==1 | dsuic==1 | dasud==1 | dmet==1 | dneuro==1 | ddgs==1 | dother==1)
+
+******************************************
+**** Diseases of the Digestive System ****
+******************************************
+
+gen fdgsm=0
+replace fdgsm=1 if ddgsm==1
+replace fdgsm=2 if ddgsm==0 & (dcvdm==1 | dcancerm==1 | dsuicm==1 | dasudm==1 | dmetm==1 | drspm==1 | dneurom==1 | dotherm==1)
+
+gen fdgs=0
+replace fdgs=1 if ddgs==1
+replace fdgs=2 if ddgs==0 & (dcvd==1 | dcancer==1 | dsuic==1 | dasud==1 | dmet==1 | drsp==1 | dneuro==1 | dother==1)
+
+****************************
+**** All other diseases ****
+****************************
+
+gen fotherm=0
+replace fotherm=1 if dotherm==1
+replace fotherm=2 if dotherm==0 & (dcvdm==1 | dcancerm==1 | dsuicm==1 | dasudm==1 | dmetm==1 | drspm==1 | dneurom==1 | ddgsm==1)
+
+gen fother=0
+replace fother=1 if dother==1
+replace fother=2 if dother==0 & (dcvd==1 | dcancer==1 | dsuic==1 | dasud==1 | dmet==1 | drsp==1 | dneuro==1 | ddgs==1)
+
+
+save "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20.dta", replace
+
+
+
+***************************************************
+***************************************************;
+
+***********************************************
+**9 FINAL ANALYSIS DATAFILE
+
+**STATA CODE**
+***********************************************;
+
+
+* age at death
+replace agdth=(dthdate-birdate)/365.25
+sum agdth
+list snz_uid rug_ref snz_deceased_year_nbr snz_deceased_month_nbr lcdate dthdate stdate birdate endate if agdth<30
+replace agdth=(dthdate-stdate)/365.25 if agdth<30
+sum agdth
+
+* total death
+replace tdth=0
+replace tdth=1 if dthdate!=.
+
+replace tdth8=0
+replace tdth8=1 if neuro==1
+replace tdth8=1 if cvd==1
+replace tdth8=1 if cancer==1
+replace tdth8=1 if suic==1
+replace tdth8=1 if asud==1
+replace tdth8=1 if met==1
+replace tdth8=1 if rsp==1
+replace tdth8=1 if dgs==1
+
+replace tdth8m=0
+replace tdth8m=1 if inlist(1,neurom,cvdm,cancerm,suicm,asudm,metm,rspm,dgsm)
+
+* total death censoring
+replace dtdth=0
+replace dtdth=1 if endate==dthdate & tdth==1
+
+save "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20_pnp.dta"
+
+
+
+
+
+
+
+
+
+
+*************************************
+*************************************
+************PAPER RESULTS************
+*************************************
+*************************************
+
+**STATA CODE**
+
+clear
+use "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20_pnp.dta"
+
+
+*************************************
+***************METHODS***************
+*************************************
+
+**p7 - number of players and non-players
+tab rug_ref
+
+
+
+*************************************
+***************RESULTS***************
+*************************************
+
+**p8 - follow-up time descriptives for players and non-players
+bysort rug_ref: sum daysy [aw=w2], d
+
+
+**p8 (from Table 1, p14): Baseline characteristics
+*ethnicity
+tab rug_ref tdth if snz_ethnicity_grp==1 [iweight=w2], row
+tab rug_ref tdth if snz_ethnicity_grp==2 [iweight=w2], row
+tab rug_ref tdth if snz_ethnicity_grp==3 [iweight=w2], row
+tab rug_ref tdth if snz_ethnicity_grp==4 [iweight=w2], row
+tab rug_ref tdth if snz_ethnicity_grp==5 [iweight=w2], row
+tab rug_ref tdth if snz_ethnicity_grp==6 [iweight=w2], row
+
+*NZ born
+bysort rug_ref: tab nzborn tdth [iweight=w2], row
+
+*Birth year
+bysort rug_ref: tab byg tdth [iweight=w2], row
+
+
+**p9 (from Table 2, p15): Mortality statistics (primary cause)
+*Number of deaths
+tab neurom rug_ref [iweight=w2], co
+tab cvdm rug_ref [iweight=w2], co
+tab cancerm rug_ref [iweight=w2], co
+tab suicm rug_ref [iweight=w2], co
+tab asudm rug_ref [iweight=w2], co
+tab metm rug_ref [iweight=w2], co
+tab rspm rug_ref [iweight=w2], co
+tab dgsm rug_ref [iweight=w2], co
+tab otherm rug_ref [iweight=w2], co
+tab tdth rug_ref [iweight=w2], co
+tab tdth8m rug_ref [iweight=w2], co
+
+*Age at death
+mean agdth [iweight=w2] if dthdate!=., over(rug_ref)
+mean agdth [iweight=w2] if tdth8m==1, over(rug_ref)
+mean agdth [iweight=w2] if neurom==1, over(rug_ref)
+mean agdth [iweight=w2] if cvdm==1, over(rug_ref)
+mean agdth [iweight=w2] if cancerm==1, over(rug_ref)
+mean agdth [iweight=w2] if suicm==1, over(rug_ref)
+mean agdth [iweight=w2] if asudm==1, over(rug_ref)
+mean agdth [iweight=w2] if metm==1, over(rug_ref)
+mean agdth [iweight=w2] if rspm==1, over(rug_ref)
+mean agdth [iweight=w2] if dgsm==1, over(rug_ref)
+mean agdth [iweight=w2] if otherm==1, over(rug_ref)
+
+*Years of life lost calculated for each cause of death as 
+*Mean (89.21 - average age at death)*number of deaths/population size
+*CIs ((89.21 - upper CI age at death)*number of deaths/population size) to ((89.21 - lower CI age at death)*number of deaths/population size)
+
+*Risk difference calculated for each cause of death as
+[number of deaths(rugby)/population size(rugby)] - [number of deaths(genpop)/population size(genpop)]
+*CIs using Wald method: +-1.96*sqrt((p1(1-p1)/n1)+(p2(1-p2)/n2))
+
+*Age at death differences calculated for each cause of death as
+average age at death(rugby) - average age at death(genpop)
+
+*Hazard ratios
+stset days [iweight=w2], failure(dtdth)
+stcox rug_ref
+
+stset days [iweight=w2], failure(dneurom)
+stcox rug_ref
+
+stset days [iweight=w2], failure(dcvdm)
+stcox rug_ref
+
+stset days [iweight=w2], failure(dcancerm)
+stcox rug_ref
+
+stset days [iweight=w2], failure(dsuicm)
+stcox rug_ref
+
+stset days [iweight=w2], failure(dasudm)
+stcox rug_ref
+
+stset days [iweight=w2], failure(dmetm)
+stcox rug_ref
+
+stset days [iweight=w2], failure(drspm)
+stcox rug_ref
+
+stset days [iweight=w2], failure(ddgsm)
+stcox rug_ref
+
+stset days [iweight=w2], failure(dotherm)
+stcox rug_ref
+
+
+**p9 (Figure 1, p16): Mortality burden
+*code: Mortality paper Figure 1.py
+
+
+**p9 (Figure 2, p17): Years of life lost difference between players and non-players
+* YLLdiff [(89.2 - average age at death)*number of deaths/population size(rugby)] - [(89.2 - average age at death)*number of deaths/population size(genpop)]
+*CIs [(89.2 - lower CI age at death)*number of deaths/population size(rugby)] - [(89.2 - upper CI age at death)*number of deaths/population size(genpop)] to 
+     [(89.2 - upper CI age at death)*number of deaths/population size(rugby)] - [(89.2 - lower CI age at death)*number of deaths/population size(genpop)]
+
+**p9-10 (Figure 3, p18-19): Hazard ratios for primary cause of death stratified by age at death 
+*stratified analyses
+replace dth=0
+replace dth=1 if dthdate!=.
+tab dth rug_ref [iw=w2]
+
+replace daysy=days/365.25
+sum daysy
+
+gen fnd3040=1
+gen fnd4050=1
+replace fnd4050=0 if daysy<=10
+gen fnd5060=1
+replace fnd5060=0 if daysy<=20
+gen fnd6070=1
+replace fnd6070=0 if daysy<=30
+gen fnd7080=1
+replace fnd7080=0 if daysy<=40
+gen fnd8090=1
+replace fnd8090=0 if daysy<=50
+gen fnd90plus=1
+replace fnd90plus=0 if daysy<=60
+tab1 fnd3040 fnd4050 fnd5060 fnd6070 fnd7080 fnd8090 fnd90plus
+
+gen endate3040=stdate+365.25*10
+format endate3040 %td
+replace endate3040=lcdate if lcdate!=. & lcdate<endate3040
+replace endate3040=dthdate if dthdate!=. & dthdate<endate3040
+gen death3040=0
+replace death3040=1 if endate3040==dthdate
+gen dth3040=0
+replace dth3040=1 if dthdate<=stdate+365.25*10
+gen days3040=endate3040-stdate
+
+gen endate4050=stdate+365.25*20
+format endate4050 %td
+replace endate4050=lcdate if lcdate!=. & lcdate<endate4050
+replace endate4050=dthdate if dthdate!=. & dthdate<endate4050
+gen death4050=0
+replace death4050=1 if endate4050==dthdate
+gen dth4050=0
+replace dth4050=1 if dthdate<=stdate+365.25*20
+gen days4050=endate4050-stdate
+
+gen endate5060=stdate+365.25*30
+format endate5060 %td
+replace endate5060=lcdate if lcdate!=. & lcdate<endate5060
+replace endate5060=dthdate if dthdate!=. & dthdate<endate5060
+gen death5060=0
+replace death5060=1 if endate5060==dthdate
+gen dth5060=0
+replace dth5060=1 if dthdate<=stdate+365.25*30
+gen days5060=endate5060-stdate
+
+gen endate6070=stdate+365.25*40
+format endate6070 %td
+replace endate6070=lcdate if lcdate!=. & lcdate<endate6070
+replace endate6070=dthdate if dthdate!=. & dthdate<endate6070
+gen death6070=0
+replace death6070=1 if endate6070==dthdate
+gen dth6070=0
+replace dth6070=1 if dthdate<=stdate+365.25*40
+gen days6070=endate6070-stdate
+
+gen endate7080=stdate+365.25*50
+format endate7080 %td
+replace endate7080=lcdate if lcdate!=. & lcdate<endate7080
+replace endate7080=dthdate if dthdate!=. & dthdate<endate7080
+gen death7080=0
+replace death7080=1 if endate7080==dthdate
+gen dth7080=0
+replace dth7080=1 if dthdate<=stdate+365.25*50
+gen days7080=endate7080-stdate
+
+gen endate8090=stdate+365.25*60
+format endate8090 %td
+replace endate8090=lcdate if lcdate!=. & lcdate<endate8090
+replace endate8090=dthdate if dthdate!=. & dthdate<endate8090
+gen death8090=0
+replace death8090=1 if endate8090==dthdate
+gen dth8090=0
+replace dth8090=1 if dthdate<=stdate+365.25*60
+gen days8090=endate8090-stdate
+
+tab dth rug_ref [iweight=w2]
+tab dth3040 rug_ref [iweight=w2] if fnd3040==1
+tab dth4050 rug_ref [iweight=w2] if fnd4050==1
+tab dth5060 rug_ref [iweight=w2] if fnd5060==1
+tab dth6070 rug_ref [iweight=w2] if fnd6070==1
+tab dth7080 rug_ref [iweight=w2] if fnd7080==1
+tab dth8090 rug_ref [iweight=w2] if fnd8090==1
+tab dtdth rug_ref [iweight=w2] if fnd90plus==1
+
+stset days3040 [iweight=w2], failure(death3040)
+stcox rug_ref if fnd3040==1
+
+stset days4050 [iweight=w2], failure(death4050)
+stcox rug_ref if fnd4050==1
+
+stset days5060 [iweight=w2], failure(death5060)
+stcox rug_ref if fnd5060==1
+
+stset days6070 [iweight=w2], failure(death6070)
+stcox rug_ref if fnd6070==1
+
+stset days7080 [iweight=w2], failure(death7080)
+stcox rug_ref if fnd7080==1
+
+stset days8090 [iweight=w2], failure(death8090)
+stcox rug_ref if fnd8090==1
+
+stset days [iweight=w2], failure(dtdth)
+stcox rug_ref if fnd90plus==1
+
+
+
+
+*************************************
+************SUPPLEMENT***************
+*************************************
+
+**Figure S1: rugby player flowchart
+
+**SAS CODE**
+libname steph "/nas/DataLab/MAA/MAA2016-21 The Health Impacts of Playing Rugby/Steph/Data";
+
+data flowchart1; 
+set steph.RugbyOG_27Jul21;
+first_played_year2 = first_played_year*1;
+if first_played_year2 ne . then rugby_ind = 1;
+if rugby_ind = 1;
+run;
+
+**Box 1**;
+proc freq data = flowchart1;
+table rugby_ind;
+run;
+
+**Box 2**;
+proc freq data = flowchart1 (where=(use=1));
+table rugby_ind;
+run;
+
+**Box 3**;
+data flowchart2;
+set flowchart1
+if use=1;
+if birth_year_nbr ge 1920;
+if last_played_year2 ge 1950;
+run;
+
+proc freq data = flowchart2;
+table rugby_ind;
+run;
+
+
+**STATA CODE
+clear
+import delimited "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\data.csv"
+
+keep if rug_ref==1
+
+duplicates list snz_uid
+
+* drop duplicates
+duplicates drop snz_uid, force
+codebook snz_uid
+
+*drop if female gender
+drop if snz_sex_code==2
+
+*drop if rugby birth year discrepant to personal detail birth year
+gen diff=birth_year_nbr-snz_birth_year_nbr
+tab diff, missing nolabel
+
+drop if diff<-1 | (diff>1 & diff<=20)
+tab diff, missing nolabel
+drop diff
+
+**Box 4**
+tab rug_ref
+
+
+*drop if last play year befre age 18
+gen diff=last_played_year-snz_birth_year_nbr
+tab diff, missing nolabel
+list last_played_year snz_birth_year_nbr if diff<18
+drop if diff<18
+tab diff, missing nolabel
+drop diff
+
+
+**Box 5**
+tab rug_ref
+
+
+*those died or left the country removed in steps G & H above to produce data3.dta file'
+clear
+use "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\data3.dta"
+
+**Box 6**
+tab rug_ref
+
+
+gen subsample=1 
+replace subsample=0 if snz_deceased_year_nbr<1988 & snz_deceased_year_nbr!=.
+replace subsample=0 if moh_mor_death_year_nbr<1988 & moh_mor_death_year_nbr!=.
+
+**Box 7**
+tab rug_ref if subsample==1
+
+
+
+**Figure S2: Kaplan Meier survival curves
+clear
+use "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\Data\mort20_pnp.dta"
+
+*Hazard ratios
+stset days [iweight=w2], failure(dtdth)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_dtdth.gph"
+
+stset days [iweight=w2], failure(dneurom)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_dneurom.gph"
+
+stset days [iweight=w2], failure(dcvdm)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_dcvdm.gph"
+
+stset days [iweight=w2], failure(dcancerm)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_dcancerm.gph"
+
+stset days [iweight=w2], failure(dsuicm)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_dsuicm.gph"
+
+stset days [iweight=w2], failure(dasudm)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_dasudm.gph"
+
+stset days [iweight=w2], failure(dmetm)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_dmetm.gph"
+
+stset days [iweight=w2], failure(drspm)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_drspm.gph"
+
+stset days [iweight=w2], failure(ddgsm)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_ddgsm.gph"
+
+stset days [iweight=w2], failure(dotherm)
+stcox rug_ref
+estat phtest, detail
+sts graph, by(rug_ref)
+graph save "Graph" "I:\MAA2016-21 The Health Impacts of Playing Rugby\Chao\mort20_dotherm.gph"
+
+
+**Table S1: ICD9 and ICD20 codes for cause of death
+
+
+**Table S2: Mortality statistics (primary or contributory cause)
+*Number of deaths
+tab neurom rug_ref [iweight=w2], co
+tab cvdm rug_ref [iweight=w2], co
+tab cancerm rug_ref [iweight=w2], co
+tab suicm rug_ref [iweight=w2], co
+tab asudm rug_ref [iweight=w2], co
+tab metm rug_ref [iweight=w2], co
+tab rspm rug_ref [iweight=w2], co
+tab dgsm rug_ref [iweight=w2], co
+tab otherm rug_ref [iweight=w2], co
+
+*Age at death
+bysort rug_ref: sum agdth [aweight=w2] if dthdate!=., detail
+bysort rug_ref: sum agdth [aweight=w2] if tdth8==1, detail
+bysort rug_ref: sum agdth [aweight=w2] if neuro==1, detail
+bysort rug_ref: sum agdth [aweight=w2] if cvd==1, detail
+bysort rug_ref: sum agdth [aweight=w2] if cancer==1, detail
+bysort rug_ref: sum agdth [aweight=w2] if suic==1, detail
+bysort rug_ref: sum agdth [aweight=w2] if asud==1, detail
+bysort rug_ref: sum agdth [aweight=w2] if met==1, detail
+bysort rug_ref: sum agdth [aweight=w2] if rsp==1, detail
+bysort rug_ref: sum agdth [aweight=w2] if dgs==1, detail
+bysort rug_ref: sum agdth [aweight=w2] if other==1, detail
+
+*Years of life lost calculated for each cause of death as 
+*(89.2 - average age at death)*number of deaths/population size
+*CIs ((89.21 - upper CI age at death)*number of deaths/population size) to ((89.21 - lower CI age at death)*number of deaths/population size)
+
+*Risk difference calculated for each cause of death as
+[number of deaths(rugby)/population size(rugby)] - [number of deaths(genpop)/population size(genpop)]
+*CIs using Wald method: +-1.96*sqrt((p1(1-p1)/n1)+(p2(1-p2)/n2))
+
+*Age at death differences calculated for each cause of death as
+average age at death(rugby) - average age at death(genpop)
+
+*Hazard ratios
+stset days [iweight=w2], failure(dneuro)
+stcox rug_ref
+estat phtest, detail
+
+stset days [iweight=w2], failure(dcvd)
+stcox rug_ref
+estat phtest, detail
+
+stset days [iweight=w2], failure(dcancer)
+stcox rug_ref
+estat phtest, detail
+
+stset days [iweight=w2], failure(dsuic)
+stcox rug_ref
+estat phtest, detail
+
+stset days [iweight=w2], failure(dasud)
+stcox rug_ref
+estat phtest, detail
+
+stset days [iweight=w2], failure(dmet)
+stcox rug_ref
+estat phtest, detail
+
+stset days [iweight=w2], failure(drsp)
+stcox rug_ref
+estat phtest, detail
+
+stset days [iweight=w2], failure(ddgs)
+stcox rug_ref
+estat phtest, detail
+
+stset days [iweight=w2], failure(dother)
+stcox rug_ref
+estat phtest, detail
+
+
+*Attributable percentage
+**??**
+
+
+*Years of life lost difference between players and non-players
+* YLLdiff [(89.2 - average age at death)*number of deaths/population size(rugby)] - [(89.2 - average age at death)*number of deaths/population size(genpop)]
+*CIs [(89.2 - lower CI age at death)*number of deaths/population size(rugby)] - [(89.2 - upper CI age at death)*number of deaths/population size(genpop)] to 
+     [(89.2 - upper CI age at death)*number of deaths/population size(rugby)] - [(89.2 - lower CI age at death)*number of deaths/population size(genpop)]
+
+
+**Table S3: Fine-Gray sub-hazard ratios
+*Primary Cause
+stset days [iweight=w2], failure(fneurom==1)
+stcrreg rug_ref, compete(fneurom==2)
+
+stset days [iweight=w2], failure(fcvdm==1)
+stcrreg rug_ref, compete(fcvdm==2)
+
+stset days [iweight=w2], failure(fcancerm==1)
+stcrreg rug_ref, compete(fcancerm==2)
+
+stset days [iweight=w2], failure(fsuicm==1)
+stcrreg rug_ref, compete(fsuicm==2)
+
+stset days [iweight=w2], failure(fasudm==1)
+stcrreg rug_ref, compete(fasudm==2)
+
+stset days [iweight=w2], failure(fmetm==1)
+stcrreg rug_ref, compete(fmetm==2)
+
+stset days [iweight=w2], failure(frspm==1)
+stcrreg rug_ref, compete(frspm==2)
+
+stset days [iweight=w2], failure(fdgsm==1)
+stcrreg rug_ref, compete(fdgsm==2)
+
+stset days [iweight=w2], failure(fotherm==1)
+stcrreg rug_ref, compete(fotherm==2)
+
+*Primary or contributory cause
+stset days [iweight=w2], failure(fneuro==1)
+stcrreg rug_ref, compete(fneuro==2)
+
+stset days [iweight=w2], failure(fcvd==1)
+stcrreg rug_ref, compete(fcvd==2)
+
+stset days [iweight=w2], failure(fcancer==1)
+stcrreg rug_ref, compete(fcancer==2)
+
+stset days [iweight=w2], failure(fsuic==1)
+stcrreg rug_ref, compete(fsuic==2)
+
+stset days [iweight=w2], failure(fasud==1)
+stcrreg rug_ref, compete(fasud==2)
+
+stset days [iweight=w2], failure(fmet==1)
+stcrreg rug_ref, compete(fmet==2)
+
+stset days [iweight=w2], failure(frsp==1)
+stcrreg rug_ref, compete(frsp==2)
+
+stset days [iweight=w2], failure(fdgs==1)
+stcrreg rug_ref, compete(fdgs==2)
+
+stset days [iweight=w2], failure(fother==1)
+stcrreg rug_ref, compete(fother==2)
+
+
+
+
+
+
+
